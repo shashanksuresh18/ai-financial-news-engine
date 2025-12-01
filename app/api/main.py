@@ -54,6 +54,15 @@ class QueryResponse(BaseModel):
     results: List[QueryResultResponse]
 
 
+class StockStoryResponse(BaseModel):
+    """
+    Used for /stock/{symbol} endpoint: story + max confidence
+    for that specific symbol in the story.
+    """
+    max_confidence: float
+    story: StoryResponse
+
+
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
@@ -233,11 +242,11 @@ INDEX_HTML = """
   </header>
   <main>
     <div class="search-box">
-      <input id="query-input" placeholder="Ask about stocks, sectors, regulators... e.g. 'HDFC Bank news' or 'interest rate impact'" />
+      <input id="query-input" placeholder="Ask about stocks, sectors, regulators... e.g. 'HDFC Bank news', 'interest rate impact', 'INFY'" />
       <button onclick="runQuery()">Search</button>
     </div>
     <div class="hint">
-      Try: <code>HDFC Bank news</code>, <code>Banking sector update</code>, <code>RBI policy changes</code>, <code>interest rate impact</code>, <code>Infosys deal</code>
+      Try: <code>HDFC Bank news</code>, <code>Banking sector update</code>, <code>RBI policy changes</code>, <code>interest rate impact</code>, <code>INFY</code>
     </div>
     <div id="status" class="hint"></div>
 
@@ -497,3 +506,44 @@ async def ingest_live():
         "total_articles": len(all_articles),
         "stories_indexed": len(enriched_stories),
     }
+
+
+@app.get("/stock/{symbol}", response_model=List[StockStoryResponse], tags=["stocks"])
+async def stock_impacts(
+    symbol: str,
+    min_confidence: float = Query(
+        0.3,
+        ge=0.0,
+        le=1.0,
+        description="Minimum impact confidence to include a story",
+    ),
+):
+    """
+    Return all stories impacting a given stock symbol, sorted by max confidence.
+    Example:
+      - /stock/INFY
+      - /stock/HDFCBANK
+    """
+    sym = symbol.upper()
+    matches: List[Tuple[StoryWithImpact, float]] = []
+
+    for story in enriched_stories:
+        confs = [
+            is_.confidence
+            for is_ in story.impacted_stocks
+            if is_.symbol.upper() == sym
+        ]
+        if confs:
+            max_conf = max(confs)
+            if max_conf >= min_confidence:
+                matches.append((story, max_conf))
+
+    matches.sort(key=lambda x: x[1], reverse=True)
+
+    return [
+        StockStoryResponse(
+            max_confidence=max_conf,
+            story=to_story_response(story),
+        )
+        for (story, max_conf) in matches
+    ]
