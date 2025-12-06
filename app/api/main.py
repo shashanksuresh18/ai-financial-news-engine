@@ -43,6 +43,11 @@ class StoryResponse(BaseModel):
     tickers: List[str]
     impacted_stocks: List[ImpactedStockResponse]
 
+    # NEW: show where this story came from + sentiment
+    sources: List[str] = []
+    sentiment: Optional[str] = None
+    sentiment_score: Optional[float] = None
+
 
 class QueryResultResponse(BaseModel):
     score: float
@@ -63,6 +68,15 @@ class StockStoryResponse(BaseModel):
     story: StoryResponse
 
 
+class AlertResponse(BaseModel):
+    """
+    Simple alert wrapper: why we think this story is important.
+    """
+    level: str   # e.g. "high", "medium"
+    reason: str  # e.g. "max confidence ≥ 0.9, regulatory impact"
+    story: StoryResponse
+
+
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
@@ -71,10 +85,10 @@ app = FastAPI(
     title="AI-Powered Financial News Intelligence API",
     description=(
         "Multi-agent LangGraph system for financial news "
-        "deduplication, entity extraction, impact mapping, and "
-        "context-aware querying."
+        "deduplication, entity extraction, impact mapping, "
+        "sentiment and context-aware querying."
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -236,7 +250,7 @@ INDEX_HTML = """
   <header>
     <div>
       <h1>AI Financial News Intelligence</h1>
-      <span>LangGraph · Dedup · Entity Mapping · Query</span>
+      <span>LangGraph · Dedup · Entity Mapping · Sentiment · Query</span>
     </div>
     <button class="live-btn" onclick="ingestLive()">+ Ingest Live RSS</button>
   </header>
@@ -291,6 +305,12 @@ INDEX_HTML = """
 
           const sectors = (story.sectors || []).join(', ');
           const regulators = (story.regulators || []).join(', ');
+          const sources = (story.sources || []).join(', ');
+
+          const sentiment = story.sentiment ? story.sentiment.toUpperCase() : '';
+          const sentimentScore = (story.sentiment_score !== null && story.sentiment_score !== undefined)
+            ? story.sentiment_score.toFixed(2)
+            : '';
 
           let impactChips = '';
           for (const s of (story.impacted_stocks || [])) {
@@ -298,6 +318,13 @@ INDEX_HTML = """
               s.symbol + ' · ' +
               s.impact_type +
               ' · ' + s.confidence.toFixed(2) +
+              '</span>';
+          }
+
+          let sentimentBadge = '';
+          if (sentiment) {
+            sentimentBadge = '<span class="badge">Sentiment: ' + sentiment +
+              (sentimentScore ? ' (' + sentimentScore + ')' : '') +
               '</span>';
           }
 
@@ -310,6 +337,8 @@ INDEX_HTML = """
               ${sectors ? '<span class="badge">Sectors: ' + sectors + '</span>' : ''}
               ${regulators ? '<span class="badge">Regulators: ' + regulators + '</span>' : ''}
               ${impacted ? '<span class="badge">Impacted: ' + impacted + '</span>' : ''}
+              ${sources ? '<span class="badge">Source: ' + sources + '</span>' : ''}
+              ${sentimentBadge}
             </div>
             <div>${impactChips}</div>
             <div class="summary">${story.summary || ''}</div>
@@ -420,6 +449,9 @@ def to_story_response(story: StoryWithImpact) -> StoryResponse:
             )
             for is_ in story.impacted_stocks
         ],
+        sources=story.sources or [],
+        sentiment=story.sentiment,
+        sentiment_score=story.sentiment_score,
     )
 
 
@@ -547,3 +579,50 @@ async def stock_impacts(
         )
         for (story, max_conf) in matches
     ]
+
+
+@app.get("/alerts", response_model=List[AlertResponse], tags=["alerts"])
+async def get_alerts(
+    min_confidence: float = Query(
+        0.9,
+        ge=0.0,
+        le=1.0,
+        description="Minimum max confidence for a story to be considered high impact",
+    ),
+):
+    """
+    Simple alert endpoint.
+
+    Returns stories that:
+      - have any impacted stock with confidence >= min_confidence, OR
+      - have regulatory impacts (e.g. RBI) on Banking / Financial sectors.
+    """
+    alerts: List[AlertResponse] = []
+
+    for story in enriched_stories:
+        # max confidence across impacted stocks
+        max_conf = 0.0
+        has_regulatory = False
+        for is_ in story.impacted_stocks:
+            max_conf = max(max_conf, is_.confidence)
+            if "regulatory" in (is_.impact_type or ""):
+                has_regulatory = True
+
+        if max_conf >= min_confidence or has_regulatory:
+            level = "high" if max_conf >= min_confidence else "medium"
+            reasons = []
+            if max_conf >= min_confidence:
+                reasons.append(f"max confidence ≥ {min_confidence}")
+            if has_regulatory:
+                reasons.append("regulatory impact present")
+            reason = ", ".join(reasons) if reasons else "high impact"
+
+            alerts.append(
+                AlertResponse(
+                    level=level,
+                    reason=reason,
+                    story=to_story_response(story),
+                )
+            )
+
+    return alerts
