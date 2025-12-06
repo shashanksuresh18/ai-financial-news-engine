@@ -1,24 +1,28 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional
+from __future__ import annotations
+
 from datetime import datetime
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
 import uuid
 
 
-def gen_id() -> str:
+def _uuid() -> str:
     return str(uuid.uuid4())
 
 
 class NewsArticle(BaseModel):
     """
-    Raw news article as ingested from any source (mock/live).
+    Raw news article as loaded from JSONL or RSS.
     """
-    id: str = Field(default_factory=gen_id)
-    source: str
-    published_at: datetime
+    id: str = Field(default_factory=_uuid)
+    source: Optional[str] = None
     title: str
     body: str
     url: Optional[str] = None
+    published_at: Optional[datetime] = None
 
+    # Optional metadata from mock file – we accept but don't rely on them.
     tickers: List[str] = []
     sectors: List[str] = []
     regulators: List[str] = []
@@ -26,34 +30,36 @@ class NewsArticle(BaseModel):
 
 class Story(BaseModel):
     """
-    Unique news event after deduplication.
+    A deduplicated news 'story' that can group multiple related articles.
     """
-    id: str = Field(default_factory=gen_id)
+    id: str = Field(default_factory=_uuid)
     title: str
-    summary: Optional[str] = None
-    article_ids: List[str] = []
+    article_ids: List[str]
 
-    # Embedding for semantic similarity
+    # Needed by DeduplicationService (used to cache story embedding)
     embedding: Optional[List[float]] = None
-
-    # These will be filled by NER + mapping later
-    sectors: List[str] = []
-    tickers: List[str] = []
-    regulators: List[str] = []
 
 
 class ImpactedStock(BaseModel):
-    """
-    Represents an individual stock impacted by a story,
-    with a confidence score and impact type (direct/sector/regulatory).
-    """
     symbol: str
     confidence: float
-    impact_type: str  # e.g. "direct", "sector", "regulatory" or combinations
+    impact_type: str
 
 
 class StoryWithImpact(Story):
     """
-    Story enriched with impact mapping information.
+    Story enriched with NLP metadata and embeddings.
+    Inherits `embedding` from Story.
     """
+    summary: Optional[str] = None
+    sectors: List[str] = []
+    regulators: List[str] = []
+    tickers: List[str] = []
     impacted_stocks: List[ImpactedStock] = []
+
+    # NEW: list of underlying article sources (e.g. MockWire, EconomicTimes)
+    sources: List[str] = []
+
+    # NEW: simple sentiment annotation over the story text
+    sentiment: Optional[str] = None
+    sentiment_score: Optional[float] = None
