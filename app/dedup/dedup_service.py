@@ -1,137 +1,187 @@
-from typing import List, Optional
-from sentence_transformers import SentenceTransformer
-import numpy as np
-import re
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+from uuid import uuid4
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 from app.models.schema import NewsArticle, Story
 
 
 class DeduplicationService:
-    def __init__(
-        self,
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        base_similarity_threshold: float = 0.78,
-        fallback_similarity_threshold: float = 0.70,
-        lexical_overlap_threshold: float = 0.30,
-    ):
-        self.model = SentenceTransformer(model_name)
-        # main threshold for “strong semantic duplicate”
-        self.base_similarity_threshold = base_similarity_threshold
-        # lower semantic threshold when lexical overlap is high
-        self.fallback_similarity_threshold = fallback_similarity_threshold
-        self.lexical_overlap_threshold = lexical_overlap_threshold
+    """
+    Lightweight deduplication using TF-IDF + cosine similarity.
 
-        # In-memory store of stories {story_id: Story}
-        self.stories: dict[str, Story] = {}
+    - Each *story* represents a cluster of similar articles.
+    - For every new article, we compare it to existing stories.
+    - If similarity >= threshold → merge into that story.
+    - Otherwise → create a new story.
 
-    # ---------- Text prep ----------
+    We re-fit a small TF-IDF model on all current stories each time a new
+    story is created. Dataset sizes in this project are small, so this is
+    fast and memory-friendly.
+    """
 
-    def _article_to_text(self, article: NewsArticle) -> str:
-        # Use title + small snippet of body to capture event context
-        snippet = article.body[:200] if article.body else ""
-        return f"{article.title}. {snippet}"
+    def __init__(self, similarity_threshold: float = 0.6) -> None:
+        # 0.6 works well for short headlines + snippets
+        self.similarity_threshold = similarity_threshold
+        self.stories: Dict[str, Story] = {}
 
-    def _tokenize(self, text: str) -> set[str]:
-        # basic tokenization: split on non-word chars & lowercase
-        return set(re.findall(r"\w+", text.lower()))
+    # ------------------------------------------------------------------ #
+    # Text helpers
+    # ------------------------------------------------------------------ #
 
-    def _lexical_overlap(self, t1: str, t2: str) -> float:
-        s1 = self._tokenize(t1)
-        s2 = self._tokenize(t2)
-        if not s1 or not s2:
-            return 0.0
-        inter = len(s1 & s2)
-        union = len(s1 | s2)
-        return inter / union if union > 0 else 0.0
+    def _article_text(self, article: NewsArticle) -> str:
+        parts: List[str] = []
 
-    # ---------- Embeddings ----------
+        if getattr(article, "title", None):
+            parts.append(article.title)
 
-    def _embed(self, text: str) -> List[float]:
-        emb = self.model.encode([text], normalize_embeddings=True)
-        return emb[0].tolist()
+        summary = getattr(article, "summary", None)
+        if summary:
+            parts.append(summary)
 
-    def _cosine_similarity(self, v1: np.ndarray, v2: np.ndarray) -> float:
-        # embeddings are normalized, so dot product == cosine similarity
-        return float(np.dot(v1, v2))
+        body = getattr(article, "body", None) or getattr(article, "content", None)
+        if body:
+            parts.append(body)
 
-    # ---------- Core matching logic ----------
+        sectors = getattr(article, "sectors", None)
+        if sectors:
+            parts.append(" ".join(sectors))
 
-    def _find_similar_story(
-        self,
-        article: NewsArticle,
-        emb: List[float],
-    ) -> Optional[str]:
-        """
-        Returns story_id of the best matching story if it qualifies as a duplicate,
-        else None.
-        Uses both semantic similarity and lexical title overlap.
-        """
+        regulators = getattr(article, "regulators", None)
+        if regulators:
+            parts.append(" ".join(regulators))
+
+        tickers = getattr(article, "tickers", None)
+        if tickers:
+            parts.append(" ".join(tickers))
+
+        return " ".join(parts)
+
+    def _story_text(self, story: Story) -> str:
+        parts: List[str] = []
+
+        if getattr(story, "title", None):
+            parts.append(story.title)
+
+        if getattr(story, "summary", None):
+            parts.append(story.summary)
+
+        sectors = getattr(story, "sectors", None)
+        if sectors:
+            parts.append(" ".join(sectors))
+
+        regulators = getattr(story, "regulators", None)
+        if regulators:
+            parts.append(" ".join(regulators))
+
+        tickers = getattr(story, "tickers", None)
+        if tickers:
+            parts.append(" ".join(tickers))
+
+        return " ".join(parts)
+
+    # ------------------------------------------------------------------ #
+    # Core similarity logic
+    # ------------------------------------------------------------------ #
+
+    def _find_similar_story(self, article: NewsArticle) -> Optional[str]:
+        """Return the ID of the most similar story, or None if no good match."""
         if not self.stories:
             return None
 
-        emb_arr = np.array(emb, dtype=np.float32)
+        # Build a tiny corpus: all story texts + the new article text
+        corpus: List[str] = [self._story_text(s) for s in self.stories.values()]
+        corpus.append(self._article_text(article))
 
-        best_id = None
-        best_sem_sim = -1.0
-        best_lex_overlap = 0.0
+        vectorizer = TfidfVectorizer(stop_words="english")
+        matrix = vectorizer.fit_transform(corpus)
 
-        for story_id, story in self.stories.items():
-            if story.embedding is None:
-                continue
+        story_matrix = matrix[:-1]  # existing stories
+        article_vec = matrix[-1]    # new article
 
-            story_emb = np.array(story.embedding, dtype=np.float32)
-            sem_sim = self._cosine_similarity(emb_arr, story_emb)
-            lex_overlap = self._lexical_overlap(article.title, story.title)
+        sims = cosine_similarity(story_matrix, article_vec).ravel()
+        best_idx = int(sims.argmax())
+        best_score = float(sims[best_idx])
 
-            # Track the best by semantic similarity (primary)
-            if sem_sim > best_sem_sim:
-                best_sem_sim = sem_sim
-                best_id = story_id
-                best_lex_overlap = lex_overlap
-
-        if best_id is None:
+        if best_score < self.similarity_threshold:
             return None
 
-        # Decision rule: strong semantic match OR weaker semantic + strong lexical overlap
-        if best_sem_sim >= self.base_similarity_threshold:
-            return best_id
-        if (
-            best_sem_sim >= self.fallback_similarity_threshold
-            and best_lex_overlap >= self.lexical_overlap_threshold
-        ):
-            return best_id
+        # Map index back to story ID
+        story_ids = list(self.stories.keys())
+        return story_ids[best_idx]
 
-        return None
-
-    # ---------- Public API ----------
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
 
     def process_article(self, article: NewsArticle) -> Story:
         """
-        Main entry: either attach to an existing story (duplicate)
-        or create a new story.
+        Deduplicate a single article.
+
+        Returns the Story the article belongs to (existing or newly created).
         """
-        text = self._article_to_text(article)
-        emb = self._embed(text)
+        similar_story_id = self._find_similar_story(article)
 
-        similar_story_id = self._find_similar_story(article, emb)
+        if similar_story_id is None:
+            # ---- Create a new story -----------------------------
+            story_id = str(uuid4())
 
-        if similar_story_id:
-            story = self.stories[similar_story_id]
-            if article.id not in story.article_ids:
-                story.article_ids.append(article.id)
-            # (Optional) update summary/embedding here if you want
-            self.stories[story.id] = story
+            summary = getattr(article, "summary", None)
+            if not summary:
+                body = getattr(article, "body", None) or getattr(
+                    article, "content", None
+                ) or ""
+                summary = body[:280]
+
+            sectors = getattr(article, "sectors", None) or []
+            regulators = getattr(article, "regulators", None) or []
+            tickers = getattr(article, "tickers", None) or []
+
+            sources: List[str] = []
+            src = getattr(article, "source", None)
+            if src:
+                sources.append(src)
+
+            story = Story(
+                id=story_id,
+                title=article.title,
+                summary=summary,
+                articles=[article.id],
+                sectors=sectors,
+                regulators=regulators,
+                tickers=tickers,
+                impacted_stocks=[],   # filled later by impact mapping
+                sources=sources,      # custom field we added earlier
+            )
+            self.stories[story_id] = story
             return story
 
-        # Create new story
-        new_story = Story(
-            title=article.title,
-            summary=article.body[:300],
-            article_ids=[article.id],
-            embedding=emb,
-        )
-        self.stories[new_story.id] = new_story
-        return new_story
+        # ---- Merge into an existing story ----------------------
+        story = self.stories[similar_story_id]
 
-    def get_all_stories(self) -> List[Story]:
-        return list(self.stories.values())
+        if article.id not in story.articles:
+            story.articles.append(article.id)
+
+        def _merge_list_attr(attr: str, new_vals: Optional[List[str]]) -> None:
+            if not new_vals:
+                return
+            existing = getattr(story, attr, None)
+            if existing is None:
+                setattr(story, attr, list(dict.fromkeys(new_vals)))
+                return
+            for v in new_vals:
+                if v not in existing:
+                    existing.append(v)
+
+        _merge_list_attr("sectors", getattr(article, "sectors", None))
+        _merge_list_attr("regulators", getattr(article, "regulators", None))
+        _merge_list_attr("tickers", getattr(article, "tickers", None))
+
+        src = getattr(article, "source", None)
+        if src:
+            _merge_list_attr("sources", [src])
+
+        return story
