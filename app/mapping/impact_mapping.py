@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Union
 
 from app.models.schema import (
     NewsArticle,
@@ -20,7 +20,7 @@ class ImpactMappingService:
       - Sectors, regulators, tickers
 
     Then we infer which stocks are impacted and how:
-      - impact_type: ['direct', 'sector', 'regulatory']
+      - impact_type: 'direct', 'sector', 'regulatory' or comma-joined combo
       - confidence: 1.0 for direct mentions, 0.7 for sector/regulatory links
     """
 
@@ -34,6 +34,10 @@ class ImpactMappingService:
     # ------------------------------------------------------------------ #
 
     def _story_text(self, story: Story, articles_by_id: Dict[str, NewsArticle]) -> str:
+        """
+        Build a lowercased text representation for rule checks:
+        story title + summary + first article title/body.
+        """
         parts: List[str] = []
 
         if getattr(story, "title", None):
@@ -42,8 +46,14 @@ class ImpactMappingService:
         if getattr(story, "summary", None):
             parts.append(story.summary)
 
-        # Include the first article's body/content if available
-        for art_id in getattr(story, "articles", []):
+        # Use article_ids (new) or articles (old) for compatibility
+        article_ids = (
+            getattr(story, "article_ids", None)
+            or getattr(story, "articles", None)
+            or []
+        )
+
+        for art_id in article_ids:
             art = articles_by_id.get(art_id)
             if not art:
                 continue
@@ -52,7 +62,7 @@ class ImpactMappingService:
             body = getattr(art, "body", None) or getattr(art, "content", None)
             if body:
                 parts.append(body)
-            break  # just one article is enough for rules
+            break  # one article is enough for rules
 
         return " ".join(parts).lower()
 
@@ -60,21 +70,43 @@ class ImpactMappingService:
         self,
         impacts: Dict[str, ImpactedStock],
         symbol: str,
-        impact_type: str,
+        impact_type: Union[str, List[str]],
         confidence: float,
     ) -> None:
+        """
+        Merge impact info:
+
+        - Accepts impact_type as str or List[str] (to be robust)
+        - Stores it as a *string* on ImpactedStock (comma-joined if multiple)
+        """
+        # Normalise to string
+        if isinstance(impact_type, list):
+            impact_type_str = ",".join(impact_type)
+        else:
+            impact_type_str = impact_type
+
         if symbol not in impacts:
             impacts[symbol] = ImpactedStock(
                 symbol=symbol,
                 confidence=confidence,
-                impact_type=[impact_type],
+                impact_type=impact_type_str,  # always a string here
             )
         else:
             st = impacts[symbol]
-            # add impact type if new
-            if impact_type not in st.impact_type:
-                st.impact_type.append(impact_type)
-            # keep the highest confidence
+            # existing is also a string, possibly "direct,sector"
+            current_types = [
+                t.strip() for t in st.impact_type.split(",") if t.strip()
+            ]
+            new_types = [
+                t.strip()
+                for t in impact_type_str.split(",")
+                if t.strip()
+            ]
+            for t in new_types:
+                if t not in current_types:
+                    current_types.append(t)
+            st.impact_type = ",".join(current_types)
+            # keep highest confidence
             if confidence > st.confidence:
                 st.confidence = confidence
 
@@ -126,27 +158,22 @@ class ImpactMappingService:
                 self._add_impact(impacts, sym, "sector", 0.7)
 
         # ---- Regulatory / macro impacts (RBI, etc.) --------------------
-        if "RBI" in regulators or "rbi" in regulators or "reserve bank of india" in text:
+        if (
+            "RBI" in regulators
+            or "rbi" in regulators
+            or "reserve bank of india" in text
+        ):
             # RBI decisions mostly affect banks, but also IT via macro
             for sym in self.bank_stocks:
                 self._add_impact(impacts, sym, "regulatory", 0.7)
-            # IT sector indirectly via demand / currency / rates
             for sym in self.it_stocks:
                 self._add_impact(impacts, sym, "sector", 0.7)
 
-        # You can add more rule blocks here for other sectors, regulators, etc.
-
         impacted_list = list(impacts.values())
 
-        # ---- Build StoryWithImpact without duplicating fields ----------
-        return StoryWithImpact(
-            id=story.id,
-            title=story.title,
-            summary=story.summary,
-            articles=story.articles,
-            sectors=story.sectors,
-            regulators=story.regulators,
-            tickers=story.tickers,
-            sources=getattr(story, "sources", []),
-            impacted_stocks=impacted_list,
-        )
+        # ---- Build StoryWithImpact from Story data ---------------------
+        # StoryWithImpact likely extends Story, so reuse Story's fields
+        story_data = story.model_dump()
+        story_data["impacted_stocks"] = impacted_list
+
+        return StoryWithImpact(**story_data)
