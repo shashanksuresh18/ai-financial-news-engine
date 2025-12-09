@@ -13,30 +13,31 @@ class DeduplicationService:
     """
     Lightweight deduplication using TF-IDF + cosine similarity.
 
-    - Each *story* represents a cluster of similar articles.
-    - For every new article, we compare it to existing stories.
-    - If similarity >= threshold → merge into that story.
-    - Otherwise → create a new story.
+    - Each Story represents a cluster of similar articles.
+    - For every new article, we compare it against existing stories.
+    - If similarity >= threshold -> merge into that story.
+    - Otherwise -> create a new story.
 
-    We re-fit a small TF-IDF model on all current stories each time a new
-    story is created. Dataset sizes in this project are small, so this is
-    fast and memory-friendly.
+    This is intentionally simple and memory-friendly for small/medium datasets.
     """
 
     def __init__(self, similarity_threshold: float = 0.6) -> None:
-        # 0.6 works well for short headlines + snippets
+        # 0.6 works reasonably for short financial news
         self.similarity_threshold = similarity_threshold
+        # story_id -> Story
         self.stories: Dict[str, Story] = {}
 
     # ------------------------------------------------------------------ #
-    # Text helpers
+    # Helpers to build text for similarity
     # ------------------------------------------------------------------ #
 
     def _article_text(self, article: NewsArticle) -> str:
+        """Concatenate useful fields from an article into one text string."""
         parts: List[str] = []
 
-        if getattr(article, "title", None):
-            parts.append(article.title)
+        title = getattr(article, "title", None)
+        if title:
+            parts.append(title)
 
         summary = getattr(article, "summary", None)
         if summary:
@@ -58,16 +59,23 @@ class DeduplicationService:
         if tickers:
             parts.append(" ".join(tickers))
 
+        source = getattr(article, "source", None)
+        if source:
+            parts.append(source)
+
         return " ".join(parts)
 
     def _story_text(self, story: Story) -> str:
+        """Concatenate useful fields from a story into one text string."""
         parts: List[str] = []
 
-        if getattr(story, "title", None):
-            parts.append(story.title)
+        title = getattr(story, "title", None)
+        if title:
+            parts.append(title)
 
-        if getattr(story, "summary", None):
-            parts.append(story.summary)
+        summary = getattr(story, "summary", None)
+        if summary:
+            parts.append(summary)
 
         sectors = getattr(story, "sectors", None)
         if sectors:
@@ -81,6 +89,10 @@ class DeduplicationService:
         if tickers:
             parts.append(" ".join(tickers))
 
+        sources = getattr(story, "sources", None)
+        if sources:
+            parts.append(" ".join(sources))
+
         return " ".join(parts)
 
     # ------------------------------------------------------------------ #
@@ -88,12 +100,15 @@ class DeduplicationService:
     # ------------------------------------------------------------------ #
 
     def _find_similar_story(self, article: NewsArticle) -> Optional[str]:
-        """Return the ID of the most similar story, or None if no good match."""
+        """
+        Return ID of the most similar story, or None if no match above threshold.
+        """
         if not self.stories:
             return None
 
-        # Build a tiny corpus: all story texts + the new article text
-        corpus: List[str] = [self._story_text(s) for s in self.stories.values()]
+        # Build corpus: all current stories + the new article
+        story_list: List[Story] = list(self.stories.values())
+        corpus: List[str] = [self._story_text(s) for s in story_list]
         corpus.append(self._article_text(article))
 
         vectorizer = TfidfVectorizer(stop_words="english")
@@ -119,17 +134,17 @@ class DeduplicationService:
 
     def process_article(self, article: NewsArticle) -> Story:
         """
-        Deduplicate a single article.
-
-        Returns the Story the article belongs to (existing or newly created).
+        Deduplicate a single article and return the Story it belongs to.
+        Creates a new Story or merges into an existing one.
         """
         similar_story_id = self._find_similar_story(article)
 
         if similar_story_id is None:
-            # ---- Create a new story -----------------------------
+            # -------- Create a fresh story -------------------------------
             story_id = str(uuid4())
 
-            summary = getattr(article, "summary", None)
+            # Simple summary fallback if Story has a summary field
+            summary: Optional[str] = getattr(article, "summary", None)
             if not summary:
                 body = getattr(article, "body", None) or getattr(
                     article, "content", None
@@ -140,31 +155,31 @@ class DeduplicationService:
             regulators = getattr(article, "regulators", None) or []
             tickers = getattr(article, "tickers", None) or []
 
-            sources: List[str] = []
-            src = getattr(article, "source", None)
-            if src:
-                sources.append(src)
+            source = getattr(article, "source", None)
+            sources: List[str] = [source] if source else []
 
+            # Note: Story requires article_ids; other fields may be optional.
             story = Story(
                 id=story_id,
                 title=article.title,
-                summary=summary,
-                articles=[article.id],
+                article_ids=[article.id],
                 sectors=sectors,
                 regulators=regulators,
                 tickers=tickers,
-                impacted_stocks=[],   # filled later by impact mapping
-                sources=sources,      # custom field we added earlier
+                sources=sources,
+                summary=summary,  # ignored if Story doesn't define it
             )
             self.stories[story_id] = story
             return story
 
-        # ---- Merge into an existing story ----------------------
+        # -------- Merge into an existing story --------------------------
         story = self.stories[similar_story_id]
 
-        if article.id not in story.articles:
-            story.articles.append(article.id)
+        # Add article id if not present
+        if article.id not in getattr(story, "article_ids", []):
+            story.article_ids.append(article.id)
 
+        # Merge list-type attributes without duplicates
         def _merge_list_attr(attr: str, new_vals: Optional[List[str]]) -> None:
             if not new_vals:
                 return
