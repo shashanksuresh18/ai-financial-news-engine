@@ -200,3 +200,12 @@ class DeduplicationService:
             _merge_list_attr("sources", [src])
 
         return story
+
+    def get_all_stories(self) -> List[Story]:
+        """
+        Return all stories as a list.
+
+        This is used by the API layer (build_index_from_articles)
+        and by the demo scripts.
+        """
+        return list(self.stories.values())
