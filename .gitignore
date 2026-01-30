@@ -1,8 +1,41 @@
-venv/
+# Python
 __pycache__/
-.pytest_cache/
-.DS_Store
-.idea/
-.vscode/
-*.pyc
+*.py[cod]
+*$py.class
+venv/
+ENV/
+env/
 .env
+.venv
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDEs
+.vscode/
+.idea/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Project specific
+.gemini/
+brain/
+data/*.jsonl
+!data/news_india.jsonl
+!data/news_uk.jsonl
+!data/mock_news.jsonl
+.system_generated/
